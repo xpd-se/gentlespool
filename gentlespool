@@ -1,0 +1,165 @@
+#!/usr/bin/perl
+#
+# gentlespool, generate tls_policy file additions for postfix
+#
+# Copyright (C) 2016 XPD AB
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# When       Who                        What
+# 2016-03-12 fredrik@xpd.se		created.
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+my $CApath = "/etc/ssl/certs/";
+
+sub usage($) {
+        my $message = shift;
+        print $message . "\n";
+        pod2usage(2);
+        exit(2);
+}
+
+# Code by Anonymous Monk (http://www.perlmonks.org/?node_id=2778)
+sub unique($) {
+	for (my $i=$#_; $i >= 0; $i--) {
+		my @rest = @_; 
+		my $test = splice(@rest, $i, 1);
+		if (grep($_ eq $_[$i], @rest)) { @_ = @rest };
+	}
+	return @_;
+}
+
+sub checkHost($) {
+	my @domains = @_;
+
+	foreach my $domain (@domains) {
+		chomp($domain);
+		my $cmd = "posttls-finger -P " . $CApath . " -c " . $domain;
+		my $output = `$cmd`;
+
+		my @cn = ();
+		my $network_fail = 0;
+		my $tls_verified = 0;
+		my $peer_matched = 0;
+		print "#\n# " . $domain . "\n#\n";
+		foreach (split(/\n/, $output)) {
+			$network_fail++ if ($_ =~ /Destination address lookup failed:/);
+			$network_fail++ if ($_ =~ /warning: no MX host for/);
+			$network_fail++ if ($_ =~ /Failed to establish session to/);
+
+			$tls_verified = 0 if ($_ =~ /^posttls-finger: Untrusted TLS/);
+			$tls_verified = 1 if ($_ =~ /^posttls-finger: Trusted TLS/);
+			$tls_verified = 2 if ($_ =~ /^posttls-finger: Verified TLS/);
+			$peer_matched = 1 if ($_ =~ /Matched subjectAltName: (.*)$/);
+			$peer_matched = 2 if ($_ =~ /Matched CommonName: (.*)$/);
+
+			if (($_ =~ /subjectAltName: (.*)$/) || ($_ =~ /CommonName (.*)$/)) {
+				my $str = $1;
+				$str =~ s/\*//;
+				push @cn, $str;
+			}
+
+			if ($_ =~ /^posttls-finger: (.*)/) {
+				print "# $1\n";
+			}
+		}
+
+		if ($network_fail gt 0) {
+			print "# ERROR: Host unreachable or unresolvable.\n\n";
+			next;
+		}
+
+		if ($tls_verified eq 0) {
+			print "# WARNING: Cannot trust peer certificate. Perhaps missing a CA or intermediate CA certificate?\n";
+		}
+
+		if (($tls_verified eq 1) and ($peer_matched eq 0)) {
+			print "# WARNING: Cannot verify peername with X.509 certificate due to MX and peer mismatch. You will need to use the \"match=\" directive.\n";
+		}
+
+		if (($tls_verified lt 2) || ($peer_matched eq 0)) {
+			print "# WARNING: Cannot enforce TLS, falling back to oppurtunistic TLS\n";
+			print $domain . "\t\t\t" . "may protocols=TLSv1 ciphers=high";
+			if ($tls_verified lt 2) {
+				if ($#cn gt 0) {
+					print " match=" . join(':', &unique(@cn));;
+				}
+			}
+			print "\n# ";
+		}
+
+		print $domain . "\t\t\t" . "verify protocols=TLSv1 ciphers=high";
+		print "\n\n";
+	}
+}
+
+#
+# End of functions
+#
+
+my $verbose = 0;
+my $debug = 0;
+my $help = 0;
+my $file = undef;
+GetOptions('verbose' => \$verbose,
+	'debug=i' => \$debug,
+	'help' => \$help,
+	'capath=s' => \$CApath,
+	'file=s' => \$file,
+        ) or &usage("Invalid commmand line options.");
+        pod2usage(1) if ($help);
+
+$verbose = 1 if ($debug gt 0);
+
+if ($#ARGV ge 0) {
+	&checkHost(@ARGV);
+}
+
+if (defined($file)) {
+	my @domains = ();
+	open(FILE, "<", $file) or die $!;
+	while (my $domain = <FILE>) {
+		push @domains, $domain;
+	}
+	&checkHost(@domains);
+}
+
+exit;
+
+__END__
+
+=head1 NAME
+
+gentlespool - Create postfix tls_policy entries
+
+=head1 SYNOPSIS
+
+gentlespool [options] domain0..domainN
+
+Options:
+
+--help brief help message
+
+--verbose enable verbose output (may be used multiple times)
+
+--debug  enable debug output (may be used multiple times)
+
+--CApath the OpenSSL CApath directory for remote SMTP server certificate verification. Default is /etc/ssl/certs
+
+--file file with list of domains, one per line
